@@ -423,6 +423,49 @@ teams_node_menu(PurpleBlistNode *node)
 
 static gulong conversation_updated_signal = 0;
 static gulong chat_conversation_typing_signal = 0;
+static gulong im_conversation_created_signal = 0;
+
+static void
+teams_im_conversation_created(PurpleConversation *conv)
+{
+	PurpleConnection *pc;
+	TeamsAccount *sa;
+	PurpleAccount *account;
+	const gchar *buddyname;
+	const gchar *convname;
+	gint history_days;
+	gint since;
+
+	if (!PURPLE_IS_IM_CONVERSATION(conv))
+		return;
+
+	pc = purple_conversation_get_connection(conv);
+	if (!PURPLE_CONNECTION_IS_CONNECTED(pc))
+		return;
+
+	if (!purple_strequal(purple_protocol_get_id(purple_connection_get_protocol(pc)), TEAMS_PLUGIN_ID))
+		return;
+
+	account = purple_connection_get_account(pc);
+
+	if (!purple_account_get_bool(account, "fetch-history", TRUE))
+		return;
+
+	history_days = purple_account_get_int(account, "history-days", 7);
+	if (history_days <= 0)
+		return;
+
+	sa = purple_connection_get_protocol_data(pc);
+
+	buddyname = purple_conversation_get_name(conv);
+	convname = g_hash_table_lookup(sa->buddy_to_chat_lookup, buddyname);
+
+	if (convname == NULL || *convname == '\0')
+		return;
+
+	since = (gint)(time(NULL) - (time_t)history_days * 86400);
+	teams_fetch_conv_history_paginated(sa, convname, since);
+}
 
 static void
 teams_login(PurpleAccount *account)
@@ -488,6 +531,9 @@ teams_login(PurpleAccount *account)
 			// Typing signal doesn't exist in this libpurple version
 			chat_conversation_typing_signal = G_MAXULONG;
 		}
+	}
+	if (!im_conversation_created_signal) {
+		im_conversation_created_signal = purple_signal_connect(purple_conversations_get_handle(), "conversation-created", purple_connection_get_protocol(pc), PURPLE_CALLBACK(teams_im_conversation_created), NULL);
 	}
 	// Setup callbacks for the preferences.
 	// handle = purple_proxy_get_handle();
@@ -989,6 +1035,12 @@ teams_protocol_init(PurpleProtocol *prpl_info)
 	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
 	
 	opt = purple_account_option_int_new(_("Notify me before meeting begins (minutes)"), "calendar_notify_minutes", -1);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_bool_new(_("Fetch conversation history when opening IM window"), "fetch-history", TRUE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_int_new(_("Days of history to fetch"), "history-days", 7);
 	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
 
 #undef TEAMS_PRPL_APPEND_ACCOUNT_OPTION

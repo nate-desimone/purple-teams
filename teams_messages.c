@@ -1529,6 +1529,146 @@ teams_get_conversation_history_since(TeamsAccount *sa, const gchar *convname, gi
 	g_free(url);
 }
 
+#define TEAMS_HISTORY_PAGE_SIZE 30
+#define TEAMS_HISTORY_MAX_PAGES 20
+
+typedef struct {
+	gchar  *convname;
+	gint    since;        /* original earliest timestamp (seconds) */
+	gint    end_before;   /* exclusive upper bound (seconds); 0 = no limit */
+	gint    page_count;   /* safety counter */
+	GSList *all_messages; /* json_object_ref'd JsonObject*, accumulated across pages */
+} TeamsHistoryFetchData;
+
+static gint
+compare_message_composetime(gconstpointer a, gconstpointer b)
+{
+	const gchar *ta = json_object_get_string_member((JsonObject *) a, "composetime");
+	const gchar *tb = json_object_get_string_member((JsonObject *) b, "composetime");
+	time_t tsa = purple_str_to_time(ta, TRUE, NULL, NULL, NULL);
+	time_t tsb = purple_str_to_time(tb, TRUE, NULL, NULL, NULL);
+
+	if (tsa < tsb) return -1;
+	if (tsa > tsb) return  1;
+	return 0;
+}
+
+// Fetch message history using paginated/batched requests to fetch the complete requested time-window
+static void
+teams_got_conv_history_paginated(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	TeamsHistoryFetchData *fetch = user_data;
+	JsonObject *obj;
+	JsonArray  *messages;
+	gint index, length;
+	gint oldest_ts = 0;
+	gboolean fetch_next = FALSE;
+
+	if (node != NULL && json_node_get_node_type(node) == JSON_NODE_OBJECT) {
+		obj      = json_node_get_object(node);
+		messages = json_object_get_array_member(obj, "messages");
+		length   = json_array_get_length(messages);
+
+		// Accumulate this page's messages (API is newest-first; index 0 = newest).
+		for (index = 0; index < length; index++) {
+			JsonObject  *message          = json_array_get_object_element(messages, index);
+			const gchar *composetime      = json_object_get_string_member(message, "composetime");
+			gint         composetimestamp = (gint) purple_str_to_time(composetime, TRUE, NULL, NULL, NULL);
+
+			// The last element (highest index) is the oldest in a newest-first array.
+			if (index == length - 1)
+				oldest_ts = composetimestamp;
+
+			if (composetimestamp > fetch->since) {
+				json_object_ref(message);
+				fetch->all_messages = g_slist_prepend(fetch->all_messages, message);
+			}
+		}
+
+		 // Request the next (older) page when:
+		 // - we received a full page (more messages likely exist)
+		 // - the oldest message is still within our target window
+		 // - we haven't hit the safety page limit
+		 // - we're making progress (oldest_ts < end_before, so we're not stuck on
+		 //    the same window. If the server ignores endTime it will return the
+		 //    same page and oldest_ts won't be less than the end_before we sent,
+		 //    stopping the loop cleanly)
+		fetch_next = (length == TEAMS_HISTORY_PAGE_SIZE
+				&& oldest_ts > fetch->since
+				&& fetch->page_count < TEAMS_HISTORY_MAX_PAGES
+				&& (fetch->end_before == 0 || oldest_ts < fetch->end_before));
+
+		if (fetch_next) {
+			TeamsHistoryFetchData *next = g_new0(TeamsHistoryFetchData, 1);
+			gchar *url;
+
+			next->convname     = g_strdup(fetch->convname);
+			next->since        = fetch->since;
+			next->end_before   = oldest_ts;
+			next->page_count   = fetch->page_count + 1;
+			next->all_messages = fetch->all_messages; /* transfer ownership */
+			fetch->all_messages = NULL;
+
+			url = g_strdup_printf(
+				TEAMS_CONTACTS_PATH_PREFIX "/v1/users/ME/conversations/%s/messages"
+				"?startTime=%d000&endTime=%d000&pageSize=%d"
+				"&view=msnp24Equivalent&targetType=Passport|Skype|Lync|Thread|PSTN|Agent",
+				purple_url_encode(next->convname),
+				next->since,
+				next->end_before - 1,
+				TEAMS_HISTORY_PAGE_SIZE);
+
+			teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL,
+					TEAMS_CONTACTS_HOST, url, NULL,
+					teams_got_conv_history_paginated, next, TRUE);
+			g_free(url);
+			g_free(fetch->convname);
+			g_free(fetch);
+			return;
+		}
+	}
+
+	//
+	// All pages received (or an error occurred). Sort the accumulated messages
+	// by composetime ascending (oldest first) so they appear in the correct
+	// order in the chat window, regardless of the order the pages arrived.
+	//
+	fetch->all_messages = g_slist_sort(fetch->all_messages, compare_message_composetime);
+	for (GSList *l = fetch->all_messages; l; l = l->next) {
+		process_message_resource(sa, (JsonObject *) l->data);
+		json_object_unref((JsonObject *) l->data);
+	}
+	g_slist_free(fetch->all_messages);
+
+	g_free(fetch->convname);
+	g_free(fetch);
+}
+
+void
+teams_fetch_conv_history_paginated(TeamsAccount *sa, const gchar *convname, gint since)
+{
+	TeamsHistoryFetchData *fetch = g_new0(TeamsHistoryFetchData, 1);
+	gchar *url;
+
+	fetch->convname   = g_strdup(convname);
+	fetch->since      = since;
+	fetch->end_before = 0;
+	fetch->page_count = 0;
+
+	url = g_strdup_printf(
+		TEAMS_CONTACTS_PATH_PREFIX "/v1/users/ME/conversations/%s/messages"
+		"?startTime=%d000&pageSize=%d"
+		"&view=msnp24Equivalent&targetType=Passport|Skype|Lync|Thread|PSTN|Agent",
+		purple_url_encode(convname),
+		since,
+		TEAMS_HISTORY_PAGE_SIZE);
+
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL,
+			TEAMS_CONTACTS_HOST, url, NULL,
+			teams_got_conv_history_paginated, fetch, TRUE);
+	g_free(url);
+}
+
 void
 teams_get_conversation_history(TeamsAccount *sa, const gchar *convname)
 {
