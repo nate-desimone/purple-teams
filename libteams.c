@@ -972,6 +972,9 @@ teams_protocol_init(PurpleProtocol *prpl_info)
 	opt = purple_account_option_bool_new(_("Collapse Teams threads into a single chat window"), "should_collapse_threads", TRUE);
 	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
 	
+	opt = purple_account_option_bool_new(_("Hide meeting chats from buddy list"), "hide_meeting_chats", FALSE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
 	opt = purple_account_option_int_new(_("Notify me before meeting begins (minutes)"), "calendar_notify_minutes", -1);
 	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
 

@@ -1735,6 +1735,30 @@ teams_find_chat(PurpleAccount *account, const char *id)
 	return teams_find_chat_from_node(account, id, purple_blist_get_root());
 }
 
+static void
+teams_purge_meeting_chats_from_blist(TeamsAccount *sa)
+{
+	if (!purple_account_get_bool(sa->account, "hide_meeting_chats", FALSE)) {
+		return;
+	}
+
+	PurpleBlistNode *node = purple_blist_get_root();
+	while (node != NULL) {
+		PurpleBlistNode *next = purple_blist_node_next(node, TRUE);
+		if (PURPLE_IS_CHAT(node)) {
+			PurpleChat *chat = PURPLE_CHAT(node);
+			if (purple_chat_get_account(chat) == sa->account) {
+				GHashTable *components = purple_chat_get_components(chat);
+				const gchar *chat_id = g_hash_table_lookup(components, "chatname");
+				if (chat_id && g_str_has_prefix(chat_id, "19:meeting_")) {
+					purple_blist_remove_chat(chat);
+				}
+			}
+		}
+		node = next;
+	}
+}
+
 
 PurpleChat *
 teams_find_chat_in_group(PurpleAccount *account, const char *id, PurpleGroup *group)
@@ -1813,6 +1837,10 @@ teams_get_friend_list_teams_cb(TeamsAccount *sa, JsonNode *node, gpointer user_d
 		} else {
 			const gchar *title = json_object_get_string_member(chat, "title");
 			PurpleChat *purple_chat = teams_find_chat(sa->account, id);
+			
+			if (g_str_has_prefix(id, "19:meeting_") && purple_account_get_bool(sa->account, "hide_meeting_chats", FALSE)) {
+				continue;
+			}
 			
 			if (purple_chat == NULL) {
 				GHashTable *components = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
@@ -2227,6 +2255,9 @@ teams_get_friend_list(TeamsAccount *sa)
 	if (!PURPLE_IS_CONNECTION(pc)) {
 		return FALSE;
 	}
+
+	// Remove any meeting chats that were persisted from previous sessions
+	teams_purge_meeting_chats_from_blist(sa);
 
 	const gchar *url = TEAMS_PROFILES_PREFIX "users/searchV2?includeDLs=true&includeBots=true&enableGuest=true&source=newChat&skypeTeamsInfo=true";
 	
