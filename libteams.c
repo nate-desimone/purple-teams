@@ -483,6 +483,10 @@ teams_login(PurpleAccount *account)
 	}
 	if (!chat_conversation_typing_signal) {
 		chat_conversation_typing_signal = purple_signal_connect(purple_conversations_get_handle(), "chat-conversation-typing", purple_connection_get_protocol(pc), PURPLE_CALLBACK(teams_conv_send_typing), NULL);
+		if (!chat_conversation_typing_signal) {
+			// Typing signal doesn't exist in this libpurple version
+			chat_conversation_typing_signal = G_MAXULONG;
+		}
 	}
 	// Setup callbacks for the preferences.
 	// handle = purple_proxy_get_handle();
@@ -512,15 +516,22 @@ teams_close(PurpleConnection *pc)
 	
 	sa = purple_connection_get_protocol_data(pc);
 	g_return_if_fail(sa != NULL);
-	
-	g_source_remove(sa->calendar_poll_timeout);
-	g_source_remove(sa->authcheck_timeout);
-	g_source_remove(sa->poll_timeout);
-	g_source_remove(sa->watchdog_timeout);
-	g_source_remove(sa->refresh_token_timeout);
-	g_source_remove(sa->idle_timeout);
-	g_source_remove(sa->login_device_code_expires_timeout);
-	g_source_remove(sa->login_device_code_timeout);
+
+	// Flush pending icon downloads for this account before cancelling
+	// HTTP connections. Otherwise the queue timer may fire after sa is
+	// freed and dereference a dangling sbuddy->sa pointer.
+	teams_flush_icon_queue_for_account(sa->account);
+
+	if (sa->calendar_poll_timeout)            g_source_remove(sa->calendar_poll_timeout);
+	if (sa->authcheck_timeout)                g_source_remove(sa->authcheck_timeout);
+	if (sa->poll_timeout)                     g_source_remove(sa->poll_timeout);
+	if (sa->watchdog_timeout)                 g_source_remove(sa->watchdog_timeout);
+	if (sa->refresh_token_timeout)            g_source_remove(sa->refresh_token_timeout);
+	if (sa->idle_timeout)                     g_source_remove(sa->idle_timeout);
+	if (sa->login_device_code_expires_timeout) g_source_remove(sa->login_device_code_expires_timeout);
+	if (sa->login_device_code_timeout)        g_source_remove(sa->login_device_code_timeout);
+	if (sa->presence_drain_source)            { g_source_remove(sa->presence_drain_source); sa->presence_drain_source = 0; }
+	if (sa->subscription_flush_timer)         { g_source_remove(sa->subscription_flush_timer); sa->subscription_flush_timer = 0; }
 	// Trouter timeouts handled in teams_trouter_stop()
 
 	teams_logout(sa);

@@ -1478,9 +1478,6 @@ teams_got_thread_users(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 	}
 	
 	teams_get_friend_profiles(sa, users_to_fetch);
-	if (!is_meeting_chat) {
-		teams_subscribe_to_contact_status(sa, users_to_fetch);
-	}
 	g_slist_free_full(users_to_fetch, g_free);
 }
 
@@ -1709,10 +1706,19 @@ teams_drain_presence_queue(gpointer user_data)
 			continue;
 		}
 
+		// Skip PSTN (telephone) contacts
+		// MRI prefix "4:" means phone number
+		// It is impossible to send or recieve IMs from these contacts, so they
+		// should not be added to the buddy list.
+		if (g_str_has_prefix(mri, "4:")) {
+			json_object_unref(response);
+			continue;
+		}
+
 		const gchar *availability = json_object_get_string_member(presence, "availability");
 		const gchar *from = teams_strip_user_prefix(mri);
 
-		if (!from || !availability) {
+		if (!from || !*from || !availability) {
 			json_object_unref(response);
 			continue;
 		}
@@ -1850,8 +1856,12 @@ teams_got_contact_statuses(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 	}
 
 	// Start the drain callback only if it isn't already running.
+	// Use g_timeout_add() instead of g_idle_add() so the drain
+	// makes progress even when the GLib main loop is continuously
+	// occupied with I/O events (a common occurance during login),
+	// which would starve an idle source indefinitely.
 	if (sa->presence_drain_source == 0) {
-		sa->presence_drain_source = g_idle_add(teams_drain_presence_queue, sa);
+		sa->presence_drain_source = g_timeout_add(50, teams_drain_presence_queue, sa);
 	}
 }
 
@@ -2023,6 +2033,13 @@ teams_subscribe_to_contact_status(TeamsAccount *sa, GSList *contacts)
 	GSList *cur = contacts;
 
 	do {
+		// Skip PSTN (telephone) contacts
+		// These start with "+" after the "4:" prefix is stripped. The presence
+		// service has no useful status data for them.
+		if (g_str_has_prefix(cur->data, "+")) {
+			continue;
+		}
+
 		// Skip contacts we've already subscribed to avoid duplicate subscriptions
 		// and the server-side snapshot storm they cause.
 		if (g_hash_table_lookup(sa->subscribed_contacts, (gconstpointer) cur->data) != NULL) {
