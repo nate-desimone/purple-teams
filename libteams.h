@@ -232,7 +232,6 @@ struct _TeamsAccount {
 	guint subscription_flush_timer;
 	GQueue *pending_presences;
 	guint presence_drain_source;
-	GHashTable *presence_mri_index;
 	
 	struct _PurpleWebsocket *trouter_socket;
 	gchar *trouter_surl;

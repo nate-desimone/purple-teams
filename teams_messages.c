@@ -1682,7 +1682,6 @@ teams_drain_presence_queue(gpointer user_data)
 
 	if (!PURPLE_IS_CONNECTION(sa->pc)) {
 		// If the connection has dropped discard all pending messages and stop.
-		g_hash_table_remove_all(sa->presence_mri_index);
 		while (!g_queue_is_empty(sa->pending_presences)) {
 			json_object_unref(g_queue_pop_head(sa->pending_presences));
 		}
@@ -1694,9 +1693,20 @@ teams_drain_presence_queue(gpointer user_data)
 	GSList *users_to_fetch = NULL;
 	gint count = 0;
 
+	// Time box the drain so that the GTK main loop always gets back control
+	// within ~20 ms.  Buddy-list redraws are expensive when the list is large.
+	// The time box prevents the 50 ms timer from queuing up faster than it drains.
+	gint64 deadline = g_get_monotonic_time() + 20000; // 20 ms from now
+
 	while (!g_queue_is_empty(sa->pending_presences) && count < TEAMS_PRESENCE_BATCH_SIZE) {
 		JsonObject *response = g_queue_pop_head(sa->pending_presences);
 		count++;
+
+		// Remove from the deduplication index now that we are processing this entry.
+		const gchar *index_mri = json_object_get_string_member(response, "mri");
+		if (index_mri) {
+			g_hash_table_remove(sa->presence_mri_index, index_mri);
+		}
 
 		JsonObject *presence = json_object_get_object_member(response, "presence");
 		const gchar *mri = json_object_get_string_member(response, "mri");
@@ -1816,12 +1826,46 @@ teams_drain_presence_queue(gpointer user_data)
 			status_message = json_object_get_string_member(note, "message");
 		}
 
-		purple_protocol_got_user_status(sa->account, from, availability, "message", status_message, NULL);
+		// Skip the expensive purple_protocol_got_user_status() and buddy-list
+		// redraw when the visible state won't change.  libpurple's
+		// purple_prpl_got_user_status() always fires "buddy-status-changed" even
+		// for no-op transitions (ex: offline -> offline), triggering a full GTK
+		// buddy-list re-sort.  At startup with "Show Offline Buddies" enabled, this
+		// could otherwise fire hundreds of times for contacts that remain offline,
+		// locking the UI.
+		gboolean should_update_availability = TRUE;
+		PurpleBuddy *existing = purple_blist_find_buddy(sa->account, from);
+		if (existing != NULL) {
+			PurplePresence *epres = purple_buddy_get_presence(existing);
+			gboolean currently_online = purple_presence_is_online(epres);
+			gboolean new_is_offline = (purple_strequal(availability, "Offline") ||
+			                          purple_strequal(availability, "PresenceUnknown"));
+			if (!currently_online && new_is_offline) {
+				// Both old and new are offline. Only push the update if the
+				// buddy status actually changed.
+				PurpleStatus *estat = purple_presence_get_active_status(epres);
+				const gchar *current_msg = estat ?
+				    purple_status_get_attr_string(estat, "message") : NULL;
+				if (g_strcmp0(current_msg, status_message) == 0) {
+					should_update_availability = FALSE;
+				}
+			}
+		}
 
-		gboolean is_idle = strstr(availability, "Idle") != NULL;
-		purple_prpl_got_user_idle(sa->account, from, is_idle, 0);
+		if (should_update_availability) {
+			purple_protocol_got_user_status(sa->account, from, availability, "message", status_message, NULL);
+
+			gboolean is_idle = strstr(availability, "Idle") != NULL;
+			purple_prpl_got_user_idle(sa->account, from, is_idle, 0);
+		}
 
 		json_object_unref(response);
+
+		// Yield if we have been in this callback for more than 20 ms so that
+		// the GTK main loop can process paint and input events before the next
+		// batch is processed.
+		if (g_get_monotonic_time() > deadline)
+			break;
 	}
 
 	if (users_to_fetch) {
@@ -1846,12 +1890,45 @@ teams_got_contact_statuses(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 		return;
 	}
 
-	// Enqueue all entries onto the shared presence queue.
+	// Enqueue all entries onto the shared presence queue, deduplicating by MRI.
+	// If an entry for the same MRI is already waiting in the queue, overwrite
+	// it with the newer payload since only the most recent status matters.
+	// This caps queue depth at the number of unique contacts rather than at the
+	// number of incoming API responses, preventing unbounded queue growth when
+	// updates arrive faster than the drain can process them.
 	guint len = json_array_get_length(responses);
 	for (guint i = 0; i < len; i++) {
 		JsonObject *resp = json_array_get_object_element(responses, i);
-		if (resp != NULL) {
+		if (resp == NULL) continue;
+
+		const gchar *mri = json_object_get_string_member(resp, "mri");
+		if (!mri || !*mri) continue;
+
+		// PSTN (4:) contacts are telephone numbers, not IM buddies.
+		if (g_str_has_prefix(mri, "4:")) continue;
+
+		// Skip if the etag is unchanged since the last drain.
+		// The server resends all subscribed contacts' presence on reconnect
+		// even when nothing changed; this avoids queuing the entire buddy
+		// list when there are no actual status changes.
+		const gchar *etag = json_object_get_string_member(resp, "etag");
+		if (etag && *etag) {
+			const gchar *cached_etag = g_hash_table_lookup(sa->presence_etag_cache, mri);
+			if (cached_etag && g_str_equal(cached_etag, etag)) continue;
+		}
+
+		// If an entry for this MRI is already queued, overwrite its data in-place.
+		// The GList node stays at its current position in the FIFO so ordering is
+		// preserved, only the payload is updated.
+		GList *existing_node = g_hash_table_lookup(sa->presence_mri_index, mri);
+		if (existing_node != NULL) {
+			json_object_unref(existing_node->data);
+			existing_node->data = json_object_ref(resp);
+		} else {
 			g_queue_push_tail(sa->pending_presences, json_object_ref(resp));
+			// Store the tail GList node for O(1) future in-place updates.
+			g_hash_table_insert(sa->presence_mri_index, g_strdup(mri),
+			                    sa->pending_presences->tail);
 		}
 	}
 
