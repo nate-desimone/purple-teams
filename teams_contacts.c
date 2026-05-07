@@ -77,6 +77,37 @@ typedef struct {
 
 static guint active_icon_downloads = 0;
 
+static void teams_get_icon_now(PurpleBuddy *buddy);
+
+static GQueue    *icon_download_queue = NULL;
+static GHashTable *icon_queue_set     = NULL;
+static guint      icon_queue_timer_id = 0;
+
+static gboolean
+teams_process_icon_queue(gpointer data)
+{
+	if (icon_download_queue == NULL || g_queue_is_empty(icon_download_queue)) {
+		icon_queue_timer_id = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	// Respect the concurrent download cap and try again next tick.
+	if (active_icon_downloads > 4) {
+		return G_SOURCE_CONTINUE;
+	}
+
+	PurpleBuddy *buddy = g_queue_pop_head(icon_download_queue);
+	if (buddy) {
+		teams_get_icon_now(buddy);
+	}
+
+	if (g_queue_is_empty(icon_download_queue)) {
+		icon_queue_timer_id = 0;
+		return G_SOURCE_REMOVE;
+	}
+	return G_SOURCE_CONTINUE;
+}
+
 static void
 teams_get_icon_cb(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
 {
@@ -87,7 +118,7 @@ teams_get_icon_cb(PurpleHttpConnection *http_conn, PurpleHttpResponse *response,
 	gsize len;
 	
 	active_icon_downloads--;
-	
+
 	if (!buddy || !purple_http_response_is_successful(response)) {
 		return;
 	}
@@ -161,27 +192,23 @@ teams_get_icon_now(PurpleBuddy *buddy)
 	active_icon_downloads++;
 }
 
-static gboolean
-teams_get_icon_queuepop(gpointer data)
-{
-	PurpleBuddy *buddy = data;
-	
-	// Only allow 4 simultaneous downloads
-	if (active_icon_downloads > 4)
-		return TRUE;
-	
-	teams_get_icon_now(buddy);
-	return FALSE;
-}
-
 void
 teams_get_icon(PurpleBuddy *buddy)
 {
 	if (!buddy) return;
 	if (purple_strequal(purple_core_get_ui(), "BitlBee"))
 		return;
-	
-	g_timeout_add(100, teams_get_icon_queuepop, (gpointer)buddy);
+
+	if (icon_download_queue == NULL) {
+		icon_download_queue = g_queue_new();
+	}
+
+	g_queue_push_tail(icon_download_queue, buddy);
+
+	// Start the single queue-processing timer if it isn't already running.
+	if (icon_queue_timer_id == 0) {
+		icon_queue_timer_id = g_timeout_add(100, teams_process_icon_queue, NULL);
+	}
 }
 
 typedef struct SkypeImgMsgContext_ {
@@ -1303,30 +1330,37 @@ teams_set_work_location_action(PurpleProtocolAction *action)
 	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_swl_got_building_info, NULL, TRUE);
 }
 
-static void
-teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
-{
-	JsonObject *obj;
+// Number of friend profile entries to process per idle tick before yielding to
+// the GTK main loop. Keeps the UI responsive during large profile fetches.
+#define TEAMS_PROFILE_BATCH_SIZE 20
+
+typedef struct {
+	PurpleConnection *pc;
 	JsonArray *contacts;
-	PurpleBuddy *buddy;
-	TeamsBuddy *sbuddy;
-	gint index, length;
-	PurpleGroup *group = teams_get_blist_group(sa);
-	
-	if (node == NULL)
-		return;
-	obj = json_node_get_object(node);
-	contacts = json_object_get_array_member(obj, "value");
-	if (contacts == NULL) {
-		// Different array key for the fetchTflConsumers call
-		contacts = json_object_get_array_member(obj, "resolvedUsers");
+	gint next_index;
+	gint length;
+} TeamsBatchProfileData;
+
+static gboolean
+teams_process_profile_batch(gpointer user_data)
+{
+	TeamsBatchProfileData *data = user_data;
+
+	if (!PURPLE_IS_CONNECTION(data->pc)) {
+		// Connection was dropped while we were idle, clean up and stop
+		json_array_unref(data->contacts);
+		g_free(data);
+		return G_SOURCE_REMOVE;
 	}
-	length = json_array_get_length(contacts);
-	
-	for(index = 0; index < length; index++)
-	{
-		JsonObject *contact = json_array_get_object_element(contacts, index);
-		
+
+	TeamsAccount *sa = purple_connection_get_protocol_data(data->pc);
+	PurpleGroup *group = teams_get_blist_group(sa);
+	gint end_index = MIN(data->next_index + TEAMS_PROFILE_BATCH_SIZE, data->length);
+	gint index;
+
+	for (index = data->next_index; index < end_index; index++) {
+		JsonObject *contact = json_array_get_object_element(data->contacts, index);
+
 		const gchar *mri = json_object_get_string_member(contact, "mri");
 		const gchar *username = teams_strip_user_prefix(mri);
 		const gchar *new_avatar;
@@ -1334,14 +1368,15 @@ teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 		const gchar *givenName = json_object_get_string_member(contact, "givenName");
 		const gchar *tenantName = json_object_get_string_member(contact, "tenantName");
 		const gchar *userType = json_object_get_string_member(contact, "type");
-		
+		PurpleBuddy *buddy;
+		TeamsBuddy *sbuddy;
+
 		buddy = purple_blist_find_buddy(sa->account, username);
-		if (!buddy)
-		{
+		if (!buddy) {
 			buddy = purple_buddy_new(sa->account, username, NULL);
 			purple_blist_add_buddy(buddy, NULL, group, NULL);
 		}
-		
+
 		sbuddy = purple_buddy_get_protocol_data(buddy);
 		if (sbuddy == NULL) {
 			sbuddy = g_new0(TeamsBuddy, 1);
@@ -1349,24 +1384,24 @@ teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 			sbuddy->skypename = g_strdup(username);
 			sbuddy->sa = sa;
 		}
-		
+
 		if (displayName && *displayName) {
-			g_free(sbuddy->display_name); 
+			g_free(sbuddy->display_name);
 			sbuddy->display_name = g_strdup(displayName);
 			if (!purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
 				purple_serv_got_alias(sa->pc, username, sbuddy->display_name);
 			}
 		}
-		
+
 		if (givenName && *givenName && !purple_strequal(json_object_get_string_member(contact, "email"), givenName)) {
 			g_free(sbuddy->fullname);
 			if (json_object_has_member(contact, "surname")) {
 				gchar *fullname = g_strconcat(givenName, " ", json_object_get_string_member(contact, "surname"), NULL);
-				
+
 				if (fullname && *fullname) {
 					purple_buddy_set_server_alias(buddy, fullname);
 				}
-				
+
 				sbuddy->fullname = fullname;
 			} else {
 				purple_buddy_set_server_alias(buddy, givenName);
@@ -1385,7 +1420,7 @@ teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 			g_free(sbuddy->user_type);
 			sbuddy->user_type = g_strdup(userType);
 		}
-		
+
 		// Only bots have images
 		new_avatar = json_object_get_string_member(contact, "imageUri");
 		if (new_avatar && *new_avatar && (!sbuddy->avatar_url || !g_str_equal(sbuddy->avatar_url, new_avatar))) {
@@ -1394,6 +1429,44 @@ teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
 		}
 		teams_get_icon(buddy);
 	}
+
+	data->next_index = end_index;
+
+	if (data->next_index >= data->length) {
+		// All entries processed
+		json_array_unref(data->contacts);
+		g_free(data);
+		return G_SOURCE_REMOVE;
+	}
+
+	// More entries remain. Yield to the main loop and continue next tick.
+	return G_SOURCE_CONTINUE;
+}
+
+static void
+teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *contacts;
+
+	if (node == NULL)
+		return;
+	obj = json_node_get_object(node);
+	contacts = json_object_get_array_member(obj, "value");
+	if (contacts == NULL) {
+		contacts = json_object_get_array_member(obj, "resolvedUsers");
+	}
+	if (contacts == NULL || json_array_get_length(contacts) == 0) {
+		return;
+	}
+
+	TeamsBatchProfileData *data = g_new0(TeamsBatchProfileData, 1);
+	data->pc = sa->pc;
+	data->contacts = json_array_ref(contacts);
+	data->next_index = 0;
+	data->length = (gint)json_array_get_length(contacts);
+
+	g_idle_add(teams_process_profile_batch, data);
 }
 
 void
@@ -1417,6 +1490,10 @@ teams_get_friend_profiles(TeamsAccount *sa, GSList *contacts)
 	do {
 		user_prefix = teams_user_url_prefix(cur->data);
 		if (g_str_equal(user_prefix, "8:") && strncmp(cur->data, "orgid:", 6) != 0) continue;
+		// Skip contacts whose profiles have already been fetched to avoid duplicate
+		// HTTP requests and the server-side throttling they cause.
+		if (g_hash_table_lookup(sa->fetched_profiles, (gconstpointer) cur->data) != NULL) continue;
+		g_hash_table_insert(sa->fetched_profiles, g_strdup(cur->data), GUINT_TO_POINTER(TRUE));
 		g_string_append_printf(postdata, ",\"%s%s\"", user_prefix, (gchar *) cur->data);
 		count++;
 
@@ -1749,16 +1826,18 @@ teams_get_friend_list_teams_cb(TeamsAccount *sa, JsonNode *node, gpointer user_d
 				
 			}
 			
-			JsonArray *members = json_object_get_array_member(chat, "members");
-			guint members_index, members_length = json_array_get_length(members);
-			
-			for(members_index = 0; members_index < members_length; members_index++)
-			{
-				JsonObject *member = json_array_get_object_element(members, members_index);
-				const gchar *mri = json_object_get_string_member(member, "mri");
-				const gchar *buddyid = teams_strip_user_prefix(mri);
+			if (!g_str_has_prefix(id, "19:meeting_")) {
+				JsonArray *members = json_object_get_array_member(chat, "members");
+				guint members_index, members_length = json_array_get_length(members);
 				
-				users_to_fetch = g_slist_prepend(users_to_fetch, g_strdup(buddyid));
+				for(members_index = 0; members_index < members_length; members_index++)
+				{
+					JsonObject *member = json_array_get_object_element(members, members_index);
+					const gchar *mri = json_object_get_string_member(member, "mri");
+					const gchar *buddyid = teams_strip_user_prefix(mri);
+					
+					users_to_fetch = g_slist_prepend(users_to_fetch, g_strdup(buddyid));
+				}
 			}
 		}
 	}

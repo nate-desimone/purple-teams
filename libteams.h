@@ -225,6 +225,14 @@ struct _TeamsAccount {
 	GHashTable *calendar_reminder_timeouts;
 	guint calendar_poll_timeout;
 	GQueue *processed_event_messages;
+	GHashTable *subscribed_contacts;
+	GHashTable *fetched_profiles;
+	GHashTable *presence_etag_cache;
+	GQueue *pending_subscription_contacts;
+	guint subscription_flush_timer;
+	GQueue *pending_presences;
+	guint presence_drain_source;
+	GHashTable *presence_mri_index;
 	
 	struct _PurpleWebsocket *trouter_socket;
 	gchar *trouter_surl;

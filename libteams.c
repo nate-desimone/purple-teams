@@ -449,6 +449,13 @@ teams_login(PurpleAccount *account)
 	sa->buddy_to_chat_lookup = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	sa->chat_to_buddy_lookup = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	sa->calendar_reminder_timeouts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->subscribed_contacts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->fetched_profiles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->presence_etag_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sa->pending_subscription_contacts = g_queue_new();
+	sa->subscription_flush_timer = 0;
+	sa->pending_presences = g_queue_new();
+	sa->presence_drain_source = 0;
 	sa->keepalive_pool = purple_http_keepalive_pool_new();
 	purple_http_keepalive_pool_set_limit_per_host(sa->keepalive_pool, TEAMS_MAX_CONNECTIONS);
 	sa->conns = purple_http_connection_set_new();
@@ -558,6 +565,19 @@ teams_close(PurpleConnection *pc)
 	g_hash_table_destroy(sa->buddy_to_chat_lookup);
 	g_hash_table_destroy(sa->chat_to_buddy_lookup);
 	g_hash_table_destroy(sa->calendar_reminder_timeouts);
+	g_hash_table_destroy(sa->subscribed_contacts);
+	g_hash_table_destroy(sa->fetched_profiles);
+	g_hash_table_destroy(sa->presence_etag_cache);
+	if (sa->subscription_flush_timer != 0) {
+		g_source_remove(sa->subscription_flush_timer);
+		sa->subscription_flush_timer = 0;
+	}
+	g_queue_free_full(sa->pending_subscription_contacts, g_free);
+	if (sa->presence_drain_source != 0) {
+		g_source_remove(sa->presence_drain_source);
+		sa->presence_drain_source = 0;
+	}
+	g_queue_free_full(sa->pending_presences, (GDestroyNotify) json_object_unref);
 	
 	g_free(sa->login_device_code);
 	g_free(sa->substrate_access_token);
